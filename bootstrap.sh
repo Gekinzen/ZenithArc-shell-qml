@@ -8,8 +8,13 @@
 #  You normally never run this by hand. install.sh detects missing
 #  deps and calls it automatically. Running it directly still works:
 #
-#      ./bootstrap.sh            interactive (Y/n prompts)
-#      ./bootstrap.sh --yes      no prompts
+#      ./bootstrap.sh            auto-yes, smart: installs only what is
+#                                missing (--needed), upgrades only when
+#                                pacman actually has pending updates
+#      ./bootstrap.sh --ask      interactive (Y/n prompts)
+#      ./bootstrap.sh --doctor   diagnose "login bounces back to the
+#                                greeter": session entries, GPU / 3D
+#                                accel, last Hyprland log, crash reports
 #
 #  Safe next to KDE / GNOME / COSMIC:
 #    - does NOT touch the display manager (SDDM / GDM / cosmic-greeter)
@@ -55,22 +60,37 @@
 #       does not support partial upgrades) and retries once with a
 #       keyring refresh. Opt out: ZEN_NO_SYSUPGRADE=1.
 #
+#    7. SMART BY DEFAULT (hf202.2). Auto-yes, no prompts. Package DB is
+#       refreshed, then `pacman -Qu` decides: no pending updates means
+#       no upgrade pass at all; packages already present are skipped
+#       (--needed); a healthy AUR helper is left alone. A second run on
+#       a finished system does nothing but verify.
+#
 #  Env:
-#    ZEN_BOOTSTRAP_AUTO=1     no prompts (install.sh sets this)
-#    ZEN_NO_SYSUPGRADE=1      skip pacman -Syu (not recommended)
+#    ZEN_BOOTSTRAP_ASK=1      Y/n prompts (same as --ask)
+#    ZEN_BOOTSTRAP_AUTO=1     force auto-yes (install.sh sets this)
+#    ZEN_NO_SYSUPGRADE=1      skip the DB refresh + upgrade (not recommended)
 #    ZEN_QUICKSHELL_PKG=...   force a quickshell package, for example
 #                             quickshell-git (default: repo quickshell)
 # ═══════════════════════════════════════════════════════════════
 set -o pipefail 2>/dev/null || true
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-AUTO="${ZEN_BOOTSTRAP_AUTO:-0}"
+
+# hf202.2: auto-yes is the default. --ask (or ZEN_BOOTSTRAP_ASK=1)
+# brings the Y/n prompts back. ZEN_BOOTSTRAP_AUTO=1 always wins.
+AUTO=1
+[ "${ZEN_BOOTSTRAP_ASK:-0}" = "1" ] && AUTO=0
+[ "${ZEN_BOOTSTRAP_AUTO:-0}" = "1" ] && AUTO=1
+MODE="install"
 
 for arg in "$@"; do
     case "$arg" in
-        --yes|-y) AUTO=1 ;;
+        --yes|-y)   AUTO=1 ;;
+        --ask|-i)   AUTO=0 ;;
+        --doctor)   MODE="doctor" ;;
         --help|-h)
-            sed -n '2,62p' "${BASH_SOURCE[0]}" | sed 's/^#//'
+            sed -n '2,75p' "${BASH_SOURCE[0]}" | sed 's/^#//'
             exit 0
             ;;
     esac
@@ -101,6 +121,142 @@ ask() {
 }
 
 have_cmd() { local c; for c in "$@"; do command -v "$c" >/dev/null 2>&1 && return 0; done; return 1; }
+
+# ═══════════════════════════════════════════════════════════════
+# --doctor : why does login bounce back to the greeter?
+# ═══════════════════════════════════════════════════════════════
+# Read-only. Run it from a TTY (Ctrl+Alt+F3) right after a failed
+# login attempt, or from any other desktop session.
+zen_doctor() {
+    local d f bin exec_line name virt latest
+    echo ""
+    echo "    ZenithArch Shell · login doctor"
+    echo "    ─────────────────────────────────────────────────────"
+
+    echo ""
+    echo "  [1] Hyprland install"
+    if have_cmd Hyprland hyprland; then
+        ok "binary: $(command -v Hyprland 2>/dev/null || command -v hyprland)"
+        note "$(Hyprland --version 2>/dev/null | head -1 || hyprland --version 2>/dev/null | head -1)"
+    else
+        bad "Hyprland binary NOT found. Run ./bootstrap.sh (or ./install.sh)."
+    fi
+    have_cmd quickshell qs && ok "quickshell: $(command -v quickshell 2>/dev/null || command -v qs)" || bad "quickshell missing"
+    if pgrep -x Hyprland >/dev/null 2>&1; then
+        ok "Hyprland is running right now (pid $(pgrep -x Hyprland | head -1))"
+    fi
+
+    echo ""
+    echo "  [2] Login session entries (/usr/share/wayland-sessions)"
+    shopt -s nullglob
+    for f in /usr/share/wayland-sessions/*.desktop; do
+        exec_line=$(grep -m1 '^Exec=' "$f" | cut -d= -f2-)
+        bin="${exec_line%% *}"
+        name=$(grep -m1 '^Name=' "$f" | cut -d= -f2-)
+        case "$name$f" in *[Hh]yprland*) ;; *) continue ;; esac
+        if command -v "$bin" >/dev/null 2>&1; then
+            ok "\"$name\"  Exec=$exec_line"
+        else
+            bad "\"$name\"  Exec=$exec_line   ('$bin' NOT installed: picking this one bounces to the greeter)"
+        fi
+        pacman -Qo "$f" >/dev/null 2>&1 || note "    ($(basename "$f") is not owned by any package)"
+    done
+    shopt -u nullglob
+
+    echo ""
+    echo "  [3] GPU / 3D acceleration"
+    virt="$(systemd-detect-virt 2>/dev/null || true)"; [ "$virt" = "none" ] && virt=""
+    [ -n "$virt" ] && note "virtual machine: $virt" || note "bare metal"
+    if compgen -G "/dev/dri/card*" >/dev/null 2>&1; then
+        ok "DRM nodes: $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+    else
+        bad "no /dev/dri/card*: no KMS device at all, Hyprland cannot start"
+    fi
+    if ! compgen -G "/dev/dri/renderD*" >/dev/null 2>&1; then
+        bad "no /dev/dri/renderD*: no render node = no 3D. In VMware enable"
+        note "    VM Settings > Display > Accelerate 3D graphics (VM powered off)."
+    fi
+    if command -v lsmod >/dev/null 2>&1; then
+        lsmod 2>/dev/null | grep -qE '^(vmwgfx|virtio_gpu|vboxvideo|amdgpu|i915|xe|nouveau|nvidia)' \
+            && note "gpu driver: $(lsmod | grep -oE '^(vmwgfx|virtio_gpu|vboxvideo|amdgpu|i915|xe|nouveau|nvidia)' | tr '\n' ' ')" \
+            || warn "no known GPU kernel driver loaded"
+    fi
+    if command -v eglinfo >/dev/null 2>&1; then
+        note "EGL: $(eglinfo -B 2>/dev/null | grep -m1 -iE 'renderer|OpenGL ES profile renderer' | sed 's/^ *//')"
+    elif command -v glxinfo >/dev/null 2>&1; then
+        note "GL: $(glxinfo -B 2>/dev/null | grep -m1 -i 'renderer' | sed 's/^ *//')"
+    else
+        note "(install mesa-utils for a renderer check: sudo pacman -S mesa-utils)"
+    fi
+    for f in "$HOME/.config/hypr/hyprland.conf" "$HOME/.config/hypr/modules/hardware.conf"; do
+        [ -f "$f" ] && grep -q 'no_hardware_cursors' "$f" && note "software cursor set in ~/${f#"$HOME"/}"
+    done
+
+    echo ""
+    echo "  [4] Hyprland config check"
+    if [ -f "$HOME/.config/hypr/hyprland.conf" ]; then
+        ok "hyprland.conf found in ~/.config/hypr"
+        if have_cmd Hyprland && Hyprland --help 2>&1 | grep -q -- '--verify-config'; then
+            if Hyprland --verify-config >/tmp/zen-verify.$$ 2>&1; then
+                ok "Hyprland --verify-config: OK"
+            else
+                warn "Hyprland --verify-config reported problems:"
+                grep -iE 'err|invalid|fail' /tmp/zen-verify.$$ | head -15 | sed 's/^/        /'
+            fi
+            rm -f /tmp/zen-verify.$$
+        fi
+    else
+        bad "no ~/.config/hypr/hyprland.conf (Hyprland writes a default one, this alone does not bounce)"
+    fi
+
+    echo ""
+    echo "  [5] Last Hyprland session log"
+    d="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr"
+    latest=""
+    if [ -d "$d" ]; then
+        latest=$(ls -t "$d" 2>/dev/null | head -1)
+    fi
+    if [ -n "$latest" ] && [ -f "$d/$latest/hyprland.log" ]; then
+        note "$d/$latest/hyprland.log (last 40 lines, errors first):"
+        grep -iE 'ERR|CRIT|fail|cannot|could not|no such|backend' "$d/$latest/hyprland.log" | tail -20 | sed 's/^/        /'
+        echo "        ..."
+        tail -n 12 "$d/$latest/hyprland.log" | sed 's/^/        /'
+    else
+        warn "no session log under $d. Hyprland never got far enough to log,"
+        note "or the greeter started it with another runtime dir. See [6] and [7]."
+    fi
+    shopt -s nullglob
+    local crashes=("${XDG_CACHE_HOME:-$HOME/.cache}"/hyprland/hyprlandCrashReport*.txt)
+    shopt -u nullglob
+    if [ ${#crashes[@]} -gt 0 ]; then
+        warn "crash reports found: ${#crashes[@]}"
+        latest=$(ls -t "${crashes[@]}" | head -1)
+        note "newest: $latest"
+        grep -m3 -iE 'signal|Version|Tag' "$latest" | sed 's/^/        /'
+    else
+        ok "no Hyprland crash reports in ~/.cache/hyprland"
+    fi
+
+    echo ""
+    echo "  [6] Journal (this boot, greeter / session / gpu lines)"
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -b --no-pager -o short 2>/dev/null \
+            | grep -iE 'hyprland|greetd|cosmic-greeter|sddm|gdm|wayland-session|vmwgfx|virtio_gpu|drm.*(error|fail)|segfault' \
+            | tail -25 | sed 's/^/        /'
+    fi
+
+    echo ""
+    echo "  [7] Manual test"
+    echo "      Ctrl+Alt+F3, log in, then run:   Hyprland"
+    echo "      Errors print straight to the TTY. Ctrl+Alt+F1 (or F2) returns to the greeter."
+    echo ""
+    echo "      Copy everything above into the chat if it is not obvious."
+    echo ""
+}
+if [ "$MODE" = "doctor" ]; then
+    zen_doctor
+    exit 0
+fi
 
 # Version label read from the shell itself, same source as install.sh
 ZEN_VER=""
@@ -211,29 +367,42 @@ fi
 # ═══════════════════════════════════════════════════════════════
 # [2/8] Sync + full upgrade
 # ═══════════════════════════════════════════════════════════════
-step 2 "Sync package databases + system upgrade..."
+step 2 "Refresh package DB + upgrade only if needed..."
 
 _have_sync_db() { compgen -G "/var/lib/pacman/sync/*.db" >/dev/null 2>&1; }
 
+_do_upgrade() {   # returns 0 if the system ends up current
+    local n
+    n=$(pacman -Qu 2>/dev/null | grep -vc '\[ignored\]')
+    if [ "${n:-0}" -eq 0 ]; then
+        ok "No pending updates, skipping upgrade"
+        return 0
+    fi
+    echo "    $n package update(s) pending, upgrading..."
+    sudo pacman -Su --noconfirm && ok "System upgraded ($n package(s))"
+}
+
 if [ "${ZEN_NO_SYSUPGRADE:-0}" = "1" ] && _have_sync_db; then
-    warn "ZEN_NO_SYSUPGRADE=1, skipping pacman -Syu"
+    warn "ZEN_NO_SYSUPGRADE=1, using the existing package DB, no upgrade"
 else
-    if sudo pacman -Syu --noconfirm; then
-        ok "System is up to date"
+    if sudo pacman -Sy --noconfirm >/dev/null 2>&1; then
+        ok "Package databases refreshed"
     else
-        warn "pacman -Syu failed. Refreshing keyrings and retrying once..."
+        warn "DB refresh failed, retrying visibly..."
+        sudo pacman -Sy --noconfirm || warn "Could not refresh package DB (mirror down?)"
+    fi
+    if ! _do_upgrade; then
+        warn "Upgrade failed. Refreshing keyrings and retrying once..."
         _keyrings="archlinux-keyring"
         for _k in cachyos-keyring endeavouros-keyring manjaro-keyring; do
             pacman -Q "$_k" >/dev/null 2>&1 && _keyrings="$_keyrings $_k"
         done
         # shellcheck disable=SC2086
         sudo pacman -Sy --needed --noconfirm $_keyrings >/dev/null 2>&1 || true
-        if sudo pacman -Su --noconfirm; then
-            ok "System is up to date (after keyring refresh)"
-        else
-            warn "System upgrade still failing. Continuing, but installs may fail."
+        _do_upgrade || {
+            warn "Upgrade still failing. Continuing, but installs may fail."
             note "Check the pacman error above (mirror, disk space, conflict)."
-        fi
+        }
     fi
 fi
 hash -r
@@ -350,10 +519,19 @@ plan_tier() {
     done
 }
 
+# Guest tools per hypervisor (repo packages only, skipped on bare metal)
+TIER_VM=()
+case "$VIRT" in
+    vmware) TIER_VM=(open-vm-tools) ;;
+    oracle) TIER_VM=(virtualbox-guest-utils) ;;
+    kvm|qemu) TIER_VM=(qemu-guest-agent spice-vdagent) ;;
+esac
+
 plan_tier core   "${TIER_CORE[@]}"
 plan_tier system "${TIER_SYSTEM[@]}"
 plan_tier zen    "${TIER_ZEN[@]}"
 plan_tier fonts  "${TIER_FONTS[@]}"
+[ ${#TIER_VM[@]} -gt 0 ] && plan_tier vm "${TIER_VM[@]}"
 
 # pipewire-pulse conflicts with pulseaudio. With --noconfirm pacman
 # answers "no" to the removal and the whole batch fails, so drop it
@@ -367,14 +545,19 @@ if pacman -Q pulseaudio >/dev/null 2>&1; then
     fi
 fi
 
-ok "${#PLAN_HAVE[@]} already installed"
-echo "    Core from official repos : ${PLAN_REPO_CORE[*]:-(none needed)}"
-[ ${#PLAN_AUR_CORE[@]} -gt 0 ] && echo "    Core from AUR            : ${PLAN_AUR_CORE[*]}"
-echo "    Other from official repos: ${#PLAN_REPO[@]} package(s)"
-echo "    Other from AUR           : ${PLAN_AUR[*]:-(none)}"
+TO_INSTALL=$(( ${#PLAN_REPO_CORE[@]} + ${#PLAN_AUR_CORE[@]} + ${#PLAN_REPO[@]} + ${#PLAN_AUR[@]} ))
+ok "${#PLAN_HAVE[@]} already installed (skipped, --needed)"
+if [ "$TO_INSTALL" -eq 0 ]; then
+    ok "Nothing to install"
+else
+    echo "    Core from official repos : ${PLAN_REPO_CORE[*]:-(none needed)}"
+    [ ${#PLAN_AUR_CORE[@]} -gt 0 ] && echo "    Core from AUR            : ${PLAN_AUR_CORE[*]}"
+    echo "    Other from official repos: ${#PLAN_REPO[@]} package(s)"
+    echo "    Other from AUR           : ${PLAN_AUR[*]:-(none)}"
+fi
 [ ${#PLAN_NONE[@]} -gt 0 ] && warn "Not found anywhere (skipped): ${PLAN_NONE[*]}"
 
-if [ $(( ${#PLAN_REPO_CORE[@]} + ${#PLAN_AUR_CORE[@]} + ${#PLAN_REPO[@]} + ${#PLAN_AUR[@]} )) -gt 0 ]; then
+if [ "$TO_INSTALL" -gt 0 ]; then
     echo ""
     if ! ask "    Proceed with installation? [Y/n] "; then
         echo "    Cancelled."
@@ -489,6 +672,7 @@ aur_install() {
 step 5 "Installing packages..."
 
 INSTALLED=(); FAILED=(); SKIPPED=()
+[ "$TO_INSTALL" -eq 0 ] && ok "Everything already present, nothing to do"
 
 # The hyprland package owns /usr/share/wayland-sessions/hyprland.desktop.
 # An unowned copy (left by the old bootstrap) makes pacman abort with
@@ -741,7 +925,9 @@ EOF
     if [ -n "$VIRT" ]; then
         cat >> "$HYPR_CONF" <<EOF
 
-# Virtual machine ($VIRT): virtual GPUs have no usable hardware cursor
+# Virtual machine ($VIRT): virtual GPUs have no usable hardware cursor,
+# and their DRM drivers do poorly with buffer modifiers.
+env = AQ_NO_MODIFIERS,1
 cursor {
     no_hardware_cursors = true
 }
@@ -768,6 +954,12 @@ if [ -n "$VIRT" ]; then
         warn "No /dev/dri/renderD* node found. 3D acceleration looks OFF,"
         note "so Hyprland will likely exit right after login until you enable it."
     fi
+    if [ "$VIRT" = "vmware" ] && pacman -Q open-vm-tools >/dev/null 2>&1 \
+       && ! systemctl is-enabled --quiet vmtoolsd 2>/dev/null; then
+        sudo systemctl enable --now vmtoolsd >/dev/null 2>&1 \
+            && ok "vmtoolsd enabled (open-vm-tools)"
+    fi
+    note "If login bounces back to the greeter:  ./bootstrap.sh --doctor"
 fi
 
 # ═══════════════════════════════════════════════════════════════
