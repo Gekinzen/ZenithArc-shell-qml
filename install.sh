@@ -17,8 +17,10 @@
 #    3. NOTHING SHIPPED IS LEFT BEHIND. A sweep + audit make sure the
 #       whole tarball lands, not just the names on a hardcoded list.
 #
-#  Flags:  --bootstrap / -b   force system-dep bootstrap first
-#          --no-bootstrap     skip auto-bootstrap (advanced)
+#  Flags:  (none needed)      missing Hyprland / Quickshell / system
+#                             deps are detected and installed for you
+#          --bootstrap / -b   force the system-dep bootstrap anyway
+#          --no-bootstrap     never auto-install system deps (advanced)
 #          --version / -V     print the version this drop installs
 #          --help / -h        usage
 #
@@ -26,6 +28,30 @@
 #          ZEN_ALLOW_PROFILE_MIGRATE=1  let migrations take your layout
 #          ZEN_FORCE_THEMES=1           overwrite edited builtin themes
 #          ZEN_FORCE_VERSIONS=1         ignore versions.lock pins
+#
+#  hf202.1 installer fix (plain ./install.sh is enough now):
+#
+#    • NO --bootstrap NEEDED. Missing core deps are installed
+#      automatically, no Y/n gate. If the [1/9] check still finds a
+#      required dep missing, bootstrap runs and install.sh restarts
+#      itself once (guarded by ZEN_BOOTSTRAP_RAN, cannot loop). The
+#      old "re-run with ./install.sh --bootstrap" dead end is gone.
+#
+#    • BROKEN AUR HELPER DETECTED. `command -v paru` said yes to a paru
+#      that crashes on start (libalpm.so.15 missing after pacman 7.1
+#      moved to libalpm.so.16). Every installer pick now goes through
+#      zen_aur_helper / zen_pkg_installer, which RUN the helper first.
+#      bootstrap.sh rebuilds a broken helper and installs all
+#      official-repo packages (Hyprland, Quickshell, jq, Qt6) with
+#      pacman directly, so a broken paru can no longer block them.
+#
+#    • CORE GATE. If Hyprland / hyprctl / Quickshell / jq are still
+#      missing after bootstrap, the install stops right there with
+#      the exact pacman command, instead of continuing into a
+#      guaranteed failure.
+#
+#    • VM CURSOR. hardware.conf gets no_hardware_cursors inside a VM
+#      (VMware / VirtualBox / QEMU), so the pointer is visible.
 #
 #  hf202 additions (nothing removed, wala tayong babawasan):
 #
@@ -551,14 +577,15 @@ Usage: install.sh [OPTIONS]
   $ZEN_SITE
 
 One command, smart by default:
-  ./install.sh          — auto-detects what's needed and does the right thing.
-                          Runs bootstrap automatically if Hyprland / Quickshell
-                          / critical deps are missing. If everything's there,
-                          installs Zen Shell directly.
+  ./install.sh          auto-detects what's needed and does the right thing.
+                        Installs Hyprland / Quickshell / critical deps by
+                        itself when they are missing (official packages via
+                        pacman, so a broken paru/yay cannot block them).
+                        If everything's there, installs Zen Shell directly.
 
 OPTIONS:
-  --bootstrap, -b       Force bootstrap.sh to run first (reinstalls
-                        all system deps even if already present).
+  --bootstrap, -b       Force bootstrap.sh to run first even when every
+                        dep is already present (sync + repair pass).
   --no-bootstrap        Skip auto-detection — go straight to Zen Shell
                         install even if deps are missing. Advanced users
                         who manage their own Hyprland/Quickshell installs.
@@ -574,6 +601,9 @@ SETTINGS SAFETY:
   ZEN_NO_MERGE=1              skip the settings deep-merge entirely
   ZEN_ALLOW_PROFILE_MIGRATE=1 let migrations take your bar/panel layout
   ZEN_FORCE_THEMES=1          overwrite builtin themes you have edited
+  ZEN_NO_SYSUPGRADE=1         bootstrap skips pacman -Syu (not recommended)
+  ZEN_QUICKSHELL_PKG=quickshell-git   use the AUR -git Quickshell instead
+                                      of the official extra/quickshell
 
 EXAMPLES:
   ./install.sh                      # The smart default — works everywhere
@@ -594,118 +624,149 @@ done
 # function. Optional deps (cava, flameshot, alacritty, etc.) are
 # handled later in the full dependency check where the user can
 # pick-and-choose.
+# hf202.1: helpers that check an AUR helper actually RUNS. A paru
+# built against an older pacman passes `command -v` but dies with
+# "libalpm.so.15: cannot open shared object file". Every installer
+# pick in this script goes through these instead of a bare command -v.
+zen_helper_ok() { command -v "$1" >/dev/null 2>&1 && "$1" --version >/dev/null 2>&1; }
+zen_aur_helper() {              # prints a WORKING paru/yay, or fails
+    local h
+    for h in paru yay; do zen_helper_ok "$h" && { echo "$h"; return 0; }; done
+    return 1
+}
+zen_pkg_installer() {           # working AUR helper, else "sudo pacman"
+    zen_aur_helper && return 0
+    command -v pacman >/dev/null 2>&1 && { echo "sudo pacman"; return 0; }
+    return 1
+}
+zen_have_cmd() { local c; for c in "$@"; do command -v "$c" >/dev/null 2>&1 && return 0; done; return 1; }
+
 CRITICAL_DEPS=(
-    hyprland       # the compositor itself
-    hyprctl        # Hyprland's CLI — scripts use it
-    quickshell     # the QML runtime that runs Zen Shell
+    hyprland       # the compositor itself (Hyprland or hyprland binary)
+    hyprctl        # Hyprland's CLI, scripts use it
+    quickshell     # the QML runtime that runs Zen Shell (quickshell or qs)
     jq             # JSON tooling used by multiple scripts
     grim           # screenshot backend
     slurp          # region selector for screenshots
     wl-copy        # clipboard (from wl-clipboard package)
-    swww           # wallpaper daemon (OR swww-daemon)
+    swww           # wallpaper daemon (swww / swww-daemon / awww)
     cava           # audio visualizer for music strings
     playerctl      # MPRIS control for music module
     notify-send    # for install-time + runtime notifications (libnotify)
 )
 
+# The four without which nothing works at all. If any is still missing
+# after bootstrap, stop here with a clear message instead of failing
+# two thousand lines later.
+CORE_DEPS=(hyprland hyprctl quickshell jq)
+
 detect_critical_deps() {
     MISSING_CRITICAL=()
+    MISSING_CORE=()
+    hash -r
+    local dep
     for dep in "${CRITICAL_DEPS[@]}"; do
-        # Special case: swww can be satisfied by swww-daemon OR awww
-        if [ "$dep" = "swww" ]; then
-            command -v swww >/dev/null 2>&1 && continue
-            command -v swww-daemon >/dev/null 2>&1 && continue
-            command -v awww >/dev/null 2>&1 && continue
-            MISSING_CRITICAL+=("$dep")
-            continue
-        fi
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            MISSING_CRITICAL+=("$dep")
-        fi
+        case "$dep" in
+            swww)       zen_have_cmd swww swww-daemon awww awww-daemon && continue ;;
+            hyprland)   zen_have_cmd Hyprland hyprland && continue ;;
+            quickshell) zen_have_cmd quickshell qs && continue ;;
+            *)          zen_have_cmd "$dep" && continue ;;
+        esac
+        MISSING_CRITICAL+=("$dep")
+    done
+    for dep in "${MISSING_CRITICAL[@]}"; do
+        case " ${CORE_DEPS[*]} " in *" $dep "*) MISSING_CORE+=("$dep") ;; esac
     done
 }
 
 run_bootstrap() {
     if [ ! -f "$SCRIPT_DIR/bootstrap.sh" ]; then
         echo "    ✗ bootstrap.sh not found next to install.sh"
-        echo "      The full release tarball includes bootstrap.sh — you may"
-        echo "      have extracted an incomplete archive. Re-download the full"
-        echo "      zen-shell-v6.15.15-complete.tar.gz."
-        exit 1
+        echo "      Re-download the full repo archive, bootstrap.sh ships"
+        echo "      right beside install.sh."
+        return 1
+    fi
+    export ZEN_BOOTSTRAP_RAN=1
+    echo ""
+    echo "    ── Installing system dependencies (bootstrap.sh) ──"
+    echo ""
+    ZEN_BOOTSTRAP_AUTO=1 bash "$SCRIPT_DIR/bootstrap.sh"
+    local rc=$?
+    hash -r
+    echo ""
+    if [ "$rc" -eq 0 ]; then
+        echo "    ── Bootstrap complete ──"
+    else
+        echo "    ── Bootstrap reported a problem (exit $rc) ──"
     fi
     echo ""
-    echo "    ── Running bootstrap.sh first ──"
+    return "$rc"
+}
+
+zen_core_missing_abort() {
     echo ""
-    bash "$SCRIPT_DIR/bootstrap.sh" || {
+    echo "    ✗ Still missing core packages: ${MISSING_CORE[*]}"
+    echo ""
+    echo "      Zen Shell cannot run without these, so the install stops"
+    echo "      here instead of failing halfway. All of them are in the"
+    echo "      official repos, no AUR helper needed. Run:"
+    echo ""
+    echo "          sudo pacman -Syu hyprland quickshell jq"
+    echo ""
+    echo "      and read the pacman error if it fails. Then re-run"
+    echo "      ./install.sh (no flags needed)."
+    if command -v paru >/dev/null 2>&1 && ! zen_helper_ok paru; then
         echo ""
-        echo "    ✗ Bootstrap failed or was cancelled. Aborting install.sh."
-        exit 1
-    }
+        echo "      Your paru is broken (built for an older pacman). Rebuild:"
+        echo "          git clone https://aur.archlinux.org/paru.git"
+        echo "          cd paru && makepkg -si"
+    fi
     echo ""
-    echo "    ── Bootstrap complete ──"
-    echo ""
+    exit 1
 }
 
 # ── Decide whether to bootstrap ──────────────────────────────────
 if [ "$DO_BOOTSTRAP" = "force" ]; then
     echo ""
-    echo "    --bootstrap specified — running bootstrap.sh unconditionally"
+    echo "    --bootstrap specified: running bootstrap.sh unconditionally"
     run_bootstrap
+    detect_critical_deps
+    [ ${#MISSING_CORE[@]} -gt 0 ] && zen_core_missing_abort
 elif [ "$DO_BOOTSTRAP" = "skip" ]; then
     echo ""
-    echo "    --no-bootstrap specified — skipping auto-detection"
+    echo "    --no-bootstrap specified: skipping auto-detection"
+elif [ "${ZEN_BOOTSTRAP_RAN:-0}" = "1" ]; then
+    # Restarted by the [1/9] safety net right after a bootstrap run.
+    # Do not bootstrap again; the [1/9] check reports anything left.
+    :
 else
-    # Auto mode — detect missing critical deps
+    # Auto mode (the default): detect, install, re-check. No prompt.
     detect_critical_deps
     if [ ${#MISSING_CRITICAL[@]} -gt 0 ]; then
         echo ""
         echo "    ── Dependency check ──"
         echo ""
-        echo "    Zen Shell needs these but they're not on your system:"
+        echo "    Not on this system yet:"
         for dep in "${MISSING_CRITICAL[@]}"; do
             echo "      ✗ $dep"
         done
         echo ""
-        echo "    This looks like a fresh install. Running bootstrap.sh will"
-        echo "    install these + other system dependencies via paru/yay/pacman,"
-        echo "    set up Hyprland, register a Wayland session, and configure"
-        echo "    the audio/bluetooth/network stack. Safe to run alongside"
-        echo "    KDE/GNOME/COSMIC — does not touch your display manager or"
-        echo "    change your default session."
-        echo ""
-        printf "    Run bootstrap.sh now? [Y/n] "
-        if read -r -t 60 BS_REPLY </dev/tty 2>/dev/null; then :; else
-            BS_REPLY="y"; echo "(no input — defaulting to yes)"
+        echo "    Installing them automatically (no --bootstrap flag needed)."
+        echo "    Official packages go through pacman directly, so a broken"
+        echo "    paru/yay cannot block Hyprland. Safe next to KDE / GNOME /"
+        echo "    COSMIC: display manager and default session stay as-is."
+        echo "    (Ctrl+C to cancel. --no-bootstrap disables this.)"
+        run_bootstrap
+        detect_critical_deps
+        if [ ${#MISSING_CORE[@]} -gt 0 ]; then
+            zen_core_missing_abort
+        elif [ ${#MISSING_CRITICAL[@]} -gt 0 ]; then
+            echo "    ⚠ Still missing (non-core, continuing): ${MISSING_CRITICAL[*]}"
+            echo ""
+        else
+            echo "    ✓ All critical dependencies now present. Continuing..."
+            echo ""
         fi
-        case "${BS_REPLY:-y}" in
-            [nN]*)
-                echo ""
-                echo "    Skipping bootstrap. The install will likely fail at"
-                echo "    the dependency check below. To install the missing"
-                echo "    packages manually:"
-                echo ""
-                echo "      paru -S ${MISSING_CRITICAL[*]}"
-                echo ""
-                echo "    Then re-run ./install.sh"
-                echo ""
-                ;;
-            *)
-                run_bootstrap
-                # Re-check after bootstrap ran — confirm success
-                detect_critical_deps
-                if [ ${#MISSING_CRITICAL[@]} -gt 0 ]; then
-                    echo "    ⚠ Still missing after bootstrap: ${MISSING_CRITICAL[*]}"
-                    echo "      The install will continue but may fail at dep check."
-                    echo ""
-                else
-                    echo "    ✓ All critical dependencies now present. Continuing..."
-                    echo ""
-                fi
-                ;;
-        esac
-    else
-        # All critical deps already present — nothing to say, proceed silently
-        :
     fi
 fi
 
@@ -2344,6 +2405,16 @@ fi
 HW_CONF="$HYPR_DIR/modules/hardware.conf"
 if [ -f "$HW_CONF" ]; then
     echo "    ${HW_CONF/$HOME/~} already exists — preserved"
+    # hf202.1: inside a VM, add the software-cursor block to an existing
+    # file only when it has no cursor setting yet. Append-only, nothing
+    # the user wrote is changed.
+    _zen_virt="$(systemd-detect-virt 2>/dev/null || true)"
+    if [ -n "$_zen_virt" ] && [ "$_zen_virt" != "none" ] \
+       && ! grep -q 'no_hardware_cursors' "$HW_CONF" 2>/dev/null; then
+        printf '\n# Virtual machine (%s): software cursor (added by install.sh hf202.1)\ncursor {\n    no_hardware_cursors = true\n}\n' \
+            "$_zen_virt" >> "$HW_CONF"
+        echo "      + added VM software-cursor block ($_zen_virt)"
+    fi
 else
     mkdir -p "$HYPR_DIR/modules"
     {
@@ -2417,6 +2488,20 @@ else
             echo "# AMD — RADV is the upstream Vulkan driver"
             echo "env = AMD_VULKAN_ICD,RADV"
             echo "env = RADV_PERFTEST,aco"
+            echo ""
+        fi
+
+        # ── Virtual machine (hf202.1) ─────────────────────────
+        # VMware / VirtualBox / QEMU virtual GPUs have no usable
+        # hardware cursor: the pointer is invisible or frozen without
+        # this. NVIDIA block above already writes the same setting.
+        _zen_virt="$(systemd-detect-virt 2>/dev/null || true)"
+        if [ -n "$_zen_virt" ] && [ "$_zen_virt" != "none" ] \
+           && ! echo "$GPU_VENDORS" | grep -q NVIDIA; then
+            echo "# Virtual machine ($_zen_virt): software cursor"
+            echo "cursor {"
+            echo "    no_hardware_cursors = true"
+            echo "}"
             echo ""
         fi
 
@@ -2515,7 +2600,7 @@ check_cmd() {
     if [ -n "$found" ]; then
         echo "    ✓ $cmd ($found)"
     elif [ "$sev" = "required" ]; then
-        echo "  ✗ $cmd MISSING — install: paru -S $pkg"
+        echo "  ✗ $cmd MISSING, install: sudo pacman -S $pkg"
         MISSING_REQUIRED=1
     else
         echo "  ○ $cmd optional — will offer: $pkg"
@@ -2711,24 +2796,27 @@ if [ "$MISSING_REQUIRED" = "1" ]; then
     echo ""
     echo "  ⚠ Missing required deps."
     echo ""
-    if [ -f "$SCRIPT_DIR/bootstrap.sh" ] && command -v pacman >/dev/null 2>&1; then
-        echo "    ── Fresh system? Use bootstrap mode ──"
-        echo ""
-        echo "    This tarball includes bootstrap.sh which installs"
-        echo "    Hyprland + Quickshell + all 35+ dependencies via"
-        echo "    paru/yay on Arch-based systems (KDE/GNOME/COSMIC safe)."
-        echo ""
-        echo "    Run:"
-        echo "       ./install.sh --bootstrap"
-        echo ""
-        echo "    ── Or install required packages manually ──"
-        echo "       paru -S quickshell-git hyprland jq"
-        echo ""
-    else
-        echo "    Install required packages first:"
-        echo "       paru -S quickshell-git hyprland jq"
-        echo ""
+    # hf202.1: no more "re-run with ./install.sh --bootstrap" dead end.
+    # Install them right now, then restart this installer ONCE. The
+    # restart is guarded by ZEN_BOOTSTRAP_RAN so it can never loop.
+    if [ "$DO_BOOTSTRAP" != "skip" ] && [ "${ZEN_BOOTSTRAP_RAN:-0}" != "1" ] \
+       && [ -f "$SCRIPT_DIR/bootstrap.sh" ] && command -v pacman >/dev/null 2>&1; then
+        echo "    Installing them automatically, then restarting install.sh..."
+        if run_bootstrap; then
+            _zs_shim_cleanup
+            exec bash "$SCRIPT_DIR/install.sh" "$@"
+        fi
     fi
+    echo "    Install the required packages (all in the official repos):"
+    echo "       sudo pacman -Syu hyprland quickshell jq"
+    echo ""
+    echo "    Then re-run ./install.sh (no flags needed)."
+    if command -v paru >/dev/null 2>&1 && ! zen_helper_ok paru; then
+        echo ""
+        echo "    Your paru is broken (built for an older pacman). Rebuild:"
+        echo "       git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si"
+    fi
+    echo ""
     exit 1
 fi
 
@@ -2739,19 +2827,38 @@ SKIPPED_OPTIONAL_PACKAGES=""
 if [ -n "$MISSING_OPTIONAL" ]; then
     echo ""
     echo "  Missing optional packages: $MISSING_OPTIONAL"
-    INSTALLER=""
-    command -v paru >/dev/null 2>&1 && INSTALLER="paru"
-    command -v yay  >/dev/null 2>&1 && [ -z "$INSTALLER" ] && INSTALLER="yay"
-    command -v pacman >/dev/null 2>&1 && [ -z "$INSTALLER" ] && INSTALLER="sudo pacman"
+    # hf202.1: pick a helper that actually RUNS (a paru that crashes on
+    # libalpm.so.15 used to be chosen here and the step just failed).
+    INSTALLER="$(zen_pkg_installer)"
 
-    if [ -n "$INSTALLER" ]; then
+    # Plain pacman cannot build AUR packages. Keep the repo ones, list
+    # the AUR-only ones as skipped instead of failing the whole batch.
+    if [ "$INSTALLER" = "sudo pacman" ]; then
+        _zen_repo_opt=""; _zen_aur_opt=""
+        for _zen_p in $MISSING_OPTIONAL; do
+            if pacman -Si "$_zen_p" >/dev/null 2>&1; then
+                _zen_repo_opt="$_zen_repo_opt $_zen_p"
+            else
+                _zen_aur_opt="$_zen_aur_opt $_zen_p"
+            fi
+        done
+        if [ -n "$_zen_aur_opt" ]; then
+            echo "  ○ No working AUR helper (paru/yay). AUR-only, skipped:$_zen_aur_opt"
+            SKIPPED_OPTIONAL_PACKAGES="$(echo "$_zen_aur_opt" | xargs)"
+        fi
+        MISSING_OPTIONAL=$(echo "$_zen_repo_opt" | xargs)
+    fi
+
+    if [ -n "$INSTALLER" ] && [ -z "$MISSING_OPTIONAL" ]; then
+        :   # everything left was AUR-only and is already reported above
+    elif [ -n "$INSTALLER" ]; then
         echo ""
         printf "  Install optional packages with %s? [Y/n] " "$INSTALLER"
         if read -r -t 30 REPLY </dev/tty 2>/dev/null; then :; else REPLY="n"; echo "(timeout — skipping)"; fi
         case "${REPLY:-y}" in
             [nN]*)
                 echo "    Skipped. Later: $INSTALLER -S $MISSING_OPTIONAL"
-                SKIPPED_OPTIONAL_PACKAGES="$MISSING_OPTIONAL"
+                SKIPPED_OPTIONAL_PACKAGES="$(echo "$SKIPPED_OPTIONAL_PACKAGES $MISSING_OPTIONAL" | xargs)"
                 ;;
             *)
                 # v7.0.0-beta.1-hf99e: optional packages are cosmetic
@@ -2774,13 +2881,13 @@ if [ -n "$MISSING_OPTIONAL" ]; then
                 else
                     echo "  ⚠ Optional fonts not installed — the shell runs fine without them."
                     echo "    Install later:  $INSTALLER -S $MISSING_OPTIONAL"
-                    SKIPPED_OPTIONAL_PACKAGES="$MISSING_OPTIONAL"
+                    SKIPPED_OPTIONAL_PACKAGES="$(echo "$SKIPPED_OPTIONAL_PACKAGES $MISSING_OPTIONAL" | xargs)"
                 fi
                 ;;
         esac
     else
-        echo "  No AUR helper found. Install manually: $MISSING_OPTIONAL"
-        SKIPPED_OPTIONAL_PACKAGES="$MISSING_OPTIONAL"
+        echo "  No package installer found. Install manually: $MISSING_OPTIONAL"
+        SKIPPED_OPTIONAL_PACKAGES="$(echo "$SKIPPED_OPTIONAL_PACKAGES $MISSING_OPTIONAL" | xargs)"
     fi
 fi
 
@@ -4468,10 +4575,9 @@ _hypr_have_system_headers() {
 # success. Used when hyprpm can't produce a matching build.
 _hyprbars_aur_fallback() {
     local HELPER="" PKG="" SO="" HYPRPM_DIR
-    command -v paru >/dev/null && HELPER=paru
-    [ -z "$HELPER" ] && command -v yay >/dev/null && HELPER=yay
+    HELPER="$(zen_aur_helper)"      # hf202.1: must actually run
     if [ -z "$HELPER" ]; then
-        echo "      (no AUR helper paru/yay — cannot auto-fallback)"
+        echo "      (no working AUR helper paru/yay, cannot auto-fallback)"
         return 1
     fi
     # Prefer -git (matches a fast-moving Hyprland), then stable.
@@ -5025,7 +5131,7 @@ ZSTAMP_EOF
         done
         echo ""
 
-        if [ -n "$FAILED_PLUGINS" ] && ! (command -v paru >/dev/null 2>&1 || command -v yay >/dev/null 2>&1); then
+        if [ -n "$FAILED_PLUGINS" ] && ! zen_aur_helper >/dev/null 2>&1; then
             echo ""
             echo "      Tip: Install an AUR helper (paru or yay) so the next install"
             echo "           can auto-fallback to per-plugin AUR packages for missing"
@@ -5429,11 +5535,9 @@ command -v hyprlock >/dev/null 2>&1 || V6163_NEED+=(hyprlock)
 command -v hypridle >/dev/null 2>&1 || V6163_NEED+=(hypridle)
 if [ ${#V6163_NEED[@]} -gt 0 ]; then
     echo "    hyprlock/hypridle missing: ${V6163_NEED[*]}"
-    V6163_INSTALLER=""
-    if command -v paru >/dev/null 2>&1; then V6163_INSTALLER="paru"
-    elif command -v yay >/dev/null 2>&1; then V6163_INSTALLER="yay"
-    elif command -v pacman >/dev/null 2>&1; then V6163_INSTALLER="sudo pacman"
-    fi
+    # hf202.1: hyprlock + hypridle are official-repo packages, and the
+    # picker skips a paru/yay that cannot run.
+    V6163_INSTALLER="$(zen_pkg_installer)"
     if [ -n "$V6163_INSTALLER" ]; then
         printf '    Install with `%s -S --needed %s`? [Y/n] ' "$V6163_INSTALLER" "${V6163_NEED[*]}"
         read -r V6163_ANS
